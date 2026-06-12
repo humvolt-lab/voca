@@ -122,7 +122,9 @@
   .hz { width:100%; height:1px; background:rgba(232,234,255,0.07); }
 
   /* ── PLAY ── */
-  #screen-play { justify-content:flex-start; gap:12px; }
+  #screen-play { justify-content:flex-start; gap:12px; overflow-y:auto;
+    -ms-overflow-style:none; scrollbar-width:none; }
+  #screen-play::-webkit-scrollbar { display:none; }
   .xy-pad-wrap { position:relative; border-radius:18px; overflow:hidden; flex-shrink:0; }
   #xyCanvas { display:block; width:100%; touch-action:none; cursor:crosshair; border-radius:18px; }
   .axis-row { display:flex; justify-content:space-between; padding:0 4px; margin-top:-4px; }
@@ -315,6 +317,7 @@
       <div class="param-bar"><div class="param-bar-fill" id="pWetBar" style="background:var(--red);width:50%"></div></div>
     </div>
   </div>
+  <div style="height:calc(var(--safe-bottom) + 8px); flex-shrink:0"></div>
 </div>
 
 <script>
@@ -578,16 +581,21 @@ function buildSlices(){
 
   const count=Math.max(1,Math.floor(S.audioBuffer.duration/dur));
   const scale=SCALES[S.mode]||SCALES.major;
-  const ko=KEY_OFF[S.key]||0;
-  const root=ko+scale[0];
 
   S.slices=[];
   for(let i=0;i<count;i++){
-    const deg=i%scale.length;
-    const oct=Math.floor(i/scale.length);
-    const semi=ko+scale[deg]+oct*12;
-    // Keep playback rate within 0.5–2.0 to avoid chipmunk/basso extremes
-    const rate=Math.max(0.5,Math.min(2.0,Math.pow(2,(semi-root)/12)));
+    // Map each slice to a scale degree within ONE octave, centered on 0 semitones.
+    // e.g. major scale degrees: 0,2,4,5,7,9,11 → spread ±5.5 semitones around root.
+    // This keeps all slices within ±1 semitone of the original pitch on average —
+    // no chipmunk, no bass rumble. Max shift is ±6 semitones (half octave).
+    const deg = i % scale.length;
+    const scaleSemi = scale[deg]; // 0–11
+    // Center the scale: subtract the midpoint of the scale span
+    const scaleSpan = scale[scale.length-1]; // e.g. 11 for major
+    const centered = scaleSemi - scaleSpan/2; // range roughly -5.5 to +5.5
+    // Apply a subtle pitch nudge: max ±4 semitones total
+    const nudge = centered * (4/6); // scale to ±4 semitones max
+    const rate = Math.pow(2, nudge/12);
     S.slices.push({start:i*dur,duration:dur,rate});
   }
   buildOrder();
@@ -861,7 +869,8 @@ function initXYPad(){
   const cv=document.getElementById('xyCanvas');
   if(xyReady) return;
   xyReady=true;
-  const size=window.innerWidth-40;
+  // Cap pad height so param cards always visible without scrolling
+  const size=Math.min(window.innerWidth-40, Math.floor(window.innerHeight*0.36));
   cv.width=size*devicePixelRatio; cv.height=size*devicePixelRatio;
   cv.style.width=size+'px'; cv.style.height=size+'px';
   const c=cv.getContext('2d');
