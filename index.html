@@ -297,13 +297,13 @@
   </div>
   <div class="param-grid">
     <div class="param-card">
-      <div class="param-name">Formant</div>
+      <div class="param-name">Formant Shift</div>
       <div class="param-value" id="pFormant">0.50</div>
       <div class="param-bar"><div class="param-bar-fill" id="pFormantBar" style="background:var(--violet);width:50%"></div></div>
     </div>
     <div class="param-card">
-      <div class="param-name">Harmonics</div>
-      <div class="param-value" id="pHarmonics">0.50</div>
+      <div class="param-name">Carrier Pitch</div>
+      <div class="param-value" id="pHarmonics">A2</div>
       <div class="param-bar"><div class="param-bar-fill" id="pHarmonicsBar" style="background:var(--green);width:50%"></div></div>
     </div>
     <div class="param-card">
@@ -639,125 +639,225 @@ function renderBars(){
 }
 
 // ═══════════════════════════════════════════════════
-//  VOCODER GRAPH — built ONCE, lives forever
-//  Architecture:
-//    sourceInput (GainNode) →
-//      dryGain → masterOut → ctx.destination
-//      [formant bank: 6 BPFs + chorus LFOs] →
-//        wetMid + wetSide → merger → masterOut
-//      masterOut → reverb → ctx.destination
+//  REAL VOCODER GRAPH — built ONCE, lives forever
 //
-//  XY pad only modulates .gain / .frequency AudioParams
-//  on the existing nodes — no new nodes created during playback.
+//  How it works:
+//    MODULATOR = vocal slice (the recorded voice)
+//    CARRIER   = thick synth (sawtooth stack + detuned voices)
+//
+//  For each of 16 frequency bands:
+//    1. BPF the modulator → measure its envelope (peak follower)
+//       via a rectifier (WaveShaper abs) + lowpass smoother
+//    2. BPF the carrier at the same frequency
+//    3. Multiply: carrier_band × modulator_envelope
+//       → the carrier "speaks" the vowel shape of the voice
+//
+//  Extra lushness:
+//    - 4 detuned sawtooth oscillators per voice (supersaw)
+//    - Chorus/ensemble on carrier before the bank
+//    - Plate reverb (convolver IR) for space
+//    - Mid/side stereo widener on output
+//    - Dry vocal blend for intelligibility
+//
+//  XY pad modulates AudioParams only — no new nodes during playback.
 // ═══════════════════════════════════════════════════
 function buildVocoderGraph(){
   if(S.vGraph) teardownVocoderGraph();
   const ctx=S.ctx;
+  const SR=ctx.sampleRate;
 
-  // Input entry point — each slice's BufferSource connects here
-  const input=ctx.createGain(); input.gain.value=1.0;
+  // ── CARRIER: supersaw stack (4 detuned saws + sub) ──
+  // All oscillators run continuously; their output feeds the band filters.
+  const carrierGain=ctx.createGain(); carrierGain.gain.value=0.0; // silent until slice plays
+  const SAW_DETUNE=[-12,-4,0,4,12]; // cents detune for width
+  const saws=SAW_DETUNE.map(det=>{
+    const o=ctx.createOscillator();
+    o.type='sawtooth';
+    o.frequency.value=110; // base pitch A2 — warm, not high
+    o.detune.value=det;
+    const g=ctx.createGain(); g.gain.value=0.22;
+    o.connect(g); g.connect(carrierGain);
+    o.start(0);
+    return {osc:o,gain:g};
+  });
+  // Sub oscillator — adds body
+  const sub=ctx.createOscillator();
+  sub.type='sine'; sub.frequency.value=55; // A1
+  const subG=ctx.createGain(); subG.gain.value=0.35;
+  sub.connect(subG); subG.connect(carrierGain);
+  sub.start(0);
 
-  // Master output
-  const master=ctx.createGain(); master.gain.value=0.75;
-  master.connect(ctx.destination);
+  // Carrier chorus — 2 slightly delayed+detuned copies for thickness
+  const chorusDelay1=ctx.createDelay(0.03); chorusDelay1.delayTime.value=0.011;
+  const chorusDelay2=ctx.createDelay(0.03); chorusDelay2.delayTime.value=0.017;
+  const chorusLFO1=ctx.createOscillator(); chorusLFO1.frequency.value=0.31; chorusLFO1.type='sine';
+  const chorusLFO2=ctx.createOscillator(); chorusLFO2.frequency.value=0.27; chorusLFO2.type='sine';
+  const clg1=ctx.createGain(); clg1.gain.value=0.003;
+  const clg2=ctx.createGain(); clg2.gain.value=0.003;
+  chorusLFO1.connect(clg1); clg1.connect(chorusDelay1.delayTime);
+  chorusLFO2.connect(clg2); clg2.connect(chorusDelay2.delayTime);
+  chorusLFO1.start(0); chorusLFO2.start(0);
+  const carrierChorus=ctx.createGain(); carrierChorus.gain.value=1.0;
+  carrierGain.connect(carrierChorus);
+  carrierGain.connect(chorusDelay1); chorusDelay1.connect(carrierChorus);
+  carrierGain.connect(chorusDelay2); chorusDelay2.connect(carrierChorus);
 
-  // Dry path
-  const dry=ctx.createGain(); dry.gain.value=0.4;
-  input.connect(dry); dry.connect(master);
+  // ── MODULATOR input (vocal slices connect here) ──
+  const modInput=ctx.createGain(); modInput.gain.value=1.0;
 
-  // Formant bandpass bank
-  const BAND_FREQS=[200,500,900,1800,3200,5500];
+  // Absolute value shaper for envelope rectification
+  // Maps x → |x| so the lowpass sees only positive signal energy
+  const rectCurve=(()=>{
+    const n=256, c=new Float32Array(n);
+    for(let i=0;i<n;i++) c[i]=Math.abs(i/(n/2)-1);
+    return c;
+  })();
+
+  // ── 16-BAND VOCODER BANK ──
+  const BAND_FREQS=[
+    80,160,280,430,600,800,1050,1350,
+    1700,2150,2700,3400,4300,5400,6800,9000
+  ];
+  const NUM_BANDS=BAND_FREQS.length;
+
   const bands=BAND_FREQS.map((freq,i)=>{
-    const bpf=ctx.createBiquadFilter();
-    bpf.type='bandpass'; bpf.frequency.value=freq; bpf.Q.value=2+i*0.4;
-    input.connect(bpf);
+    const Q=3.5; // narrow enough for formant resolution, wide enough for smooth sound
 
-    // Per-band gain (wet contribution)
-    const bg=ctx.createGain(); bg.gain.value=0.55/BAND_FREQS.length;
-    bpf.connect(bg);
+    // MODULATOR band: BPF vocal → rectify → smooth → controls VCA gain
+    const modBPF=ctx.createBiquadFilter();
+    modBPF.type='bandpass'; modBPF.frequency.value=freq; modBPF.Q.value=Q;
+    modInput.connect(modBPF);
 
-    // Slow chorus LFO per band — modulates filter freq slightly
+    const rect=ctx.createWaveShaper(); rect.curve=rectCurve;
+    modBPF.connect(rect);
+
+    // Envelope smoother: lowpass at ~30Hz tracks amplitude of band
+    const envLP=ctx.createBiquadFilter();
+    envLP.type='lowpass'; envLP.frequency.value=30;
+    rect.connect(envLP);
+
+    // VCA: carrier band amplitude = modulator envelope
+    // envLP output drives the gain AudioParam of a GainNode
+    // We use a GainNode where .gain is modulated by the envelope signal
+    const vca=ctx.createGain(); vca.gain.value=0; // starts silent
+    // Connect envelope signal to the gain param (this is the key vocoder step)
+    envLP.connect(vca.gain);
+
+    // CARRIER band: BPF synth at same frequency
+    const carBPF=ctx.createBiquadFilter();
+    carBPF.type='bandpass'; carBPF.frequency.value=freq; carBPF.Q.value=Q;
+    carrierChorus.connect(carBPF);
+    carBPF.connect(vca);
+
+    // Per-band slow LFO on carrier BPF freq for subtle shimmer/chorus
     const lfo=ctx.createOscillator();
-    lfo.type='sine';
-    lfo.frequency.value=0.08+i*0.04+Math.random()*0.03;
-    const lfog=ctx.createGain(); lfog.gain.value=freq*0.015;
-    lfo.connect(lfog); lfog.connect(bpf.frequency);
+    lfo.type='sine'; lfo.frequency.value=0.06+i*0.018;
+    const lfog=ctx.createGain(); lfog.gain.value=freq*0.012;
+    lfo.connect(lfog); lfog.connect(carBPF.frequency);
     lfo.start(0);
 
-    return {bpf,bg,lfo,lfog,baseFreq:freq};
+    return {modBPF,rect,envLP,vca,carBPF,lfo,lfog,baseFreq:freq};
   });
 
-  // Stereo width via mid/side
-  const midG=ctx.createGain(); midG.gain.value=1.0;
-  const sideG=ctx.createGain(); sideG.gain.value=0.5;
-  bands.forEach(b=>{ b.bg.connect(midG); b.bg.connect(sideG); });
+  // ── MIX + STEREO WIDTH ──
+  const wetMix=ctx.createGain(); wetMix.gain.value=1.4;
+  bands.forEach(b=>b.vca.connect(wetMix));
 
+  // Mid/side stereo widener
+  const midG=ctx.createGain(); midG.gain.value=1.0;
+  const sideG=ctx.createGain(); sideG.gain.value=0.6;
+  wetMix.connect(midG); wetMix.connect(sideG);
   const merger=ctx.createChannelMerger(2);
   midG.connect(merger,0,0);
   sideG.connect(merger,0,1);
+
+  // Master output
+  const master=ctx.createGain(); master.gain.value=0.8;
   merger.connect(master);
 
-  // Reverb (built once with a 1.5s IR)
-  const revSend=ctx.createGain(); revSend.gain.value=0.22;
+  // Dry vocal blend (keeps intelligibility)
+  const dry=ctx.createGain(); dry.gain.value=0.08;
+  modInput.connect(dry); dry.connect(master);
+
+  master.connect(ctx.destination);
+
+  // ── PLATE REVERB ──
+  const revSend=ctx.createGain(); revSend.gain.value=0.25;
   const conv=ctx.createConvolver();
-  const irLen=Math.floor(ctx.sampleRate*1.5);
-  const ir=ctx.createBuffer(2,irLen,ctx.sampleRate);
+  // Build a smooth plate-ish IR: exponential decay with early reflections
+  const irLen=Math.floor(SR*2.2);
+  const ir=ctx.createBuffer(2,irLen,SR);
   for(let ch=0;ch<2;ch++){
     const d=ir.getChannelData(ch);
-    for(let i=0;i<irLen;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/irLen,2.8);
+    for(let i=0;i<irLen;i++){
+      // Early reflections cluster
+      const early=i<SR*0.02 ? Math.random()*0.6*(1-i/(SR*0.02)) : 0;
+      // Diffuse tail
+      const tail=(Math.random()*2-1)*Math.pow(1-i/irLen,1.8);
+      d[i]=early+tail*0.4;
+    }
   }
   conv.buffer=ir;
-  const revReturn=ctx.createGain(); revReturn.gain.value=0.3;
-  master.connect(revSend); revSend.connect(conv); conv.connect(revReturn); revReturn.connect(ctx.destination);
+  const revReturn=ctx.createGain(); revReturn.gain.value=0.28;
+  master.connect(revSend); revSend.connect(conv); conv.connect(revReturn);
+  revReturn.connect(ctx.destination);
 
-  S.vGraph={input,master,dry,bands,midG,sideG,merger,revSend,conv,revReturn};
-  applyXY(); // set initial param values
+  S.vGraph={
+    modInput, carrierGain, master, dry, wetMix,
+    bands, midG, sideG, merger,
+    saws, sub, subG,
+    chorusDelay1, chorusDelay2, chorusLFO1, chorusLFO2, clg1, clg2,
+    carrierChorus, revSend, conv, revReturn
+  };
+  applyXY();
 }
 
 function teardownVocoderGraph(){
   if(!S.vGraph) return;
-  // Stop oscillators
-  S.vGraph.bands.forEach(b=>{ try{b.lfo.stop();}catch(e){} });
-  // Disconnect all
-  try { S.vGraph.input.disconnect(); } catch(e){}
-  try { S.vGraph.master.disconnect(); } catch(e){}
-  try { S.vGraph.dry.disconnect(); } catch(e){}
-  S.vGraph.bands.forEach(b=>{
-    try{b.bpf.disconnect();}catch(e){}
-    try{b.bg.disconnect();}catch(e){}
-    try{b.lfog.disconnect();}catch(e){}
+  const g=S.vGraph;
+  const stopDisc=n=>{ try{n.stop();}catch(e){} try{n.disconnect();}catch(e){} };
+  const disc=n=>{ try{n.disconnect();}catch(e){} };
+  g.saws.forEach(s=>{ stopDisc(s.osc); disc(s.gain); });
+  stopDisc(g.sub); disc(g.subG);
+  stopDisc(g.chorusLFO1); stopDisc(g.chorusLFO2);
+  disc(g.clg1); disc(g.clg2);
+  disc(g.chorusDelay1); disc(g.chorusDelay2); disc(g.carrierChorus);
+  g.bands.forEach(b=>{
+    stopDisc(b.lfo); disc(b.lfog);
+    disc(b.modBPF); disc(b.rect); disc(b.envLP); disc(b.vca); disc(b.carBPF);
   });
-  try{S.vGraph.midG.disconnect();}catch(e){}
-  try{S.vGraph.sideG.disconnect();}catch(e){}
-  try{S.vGraph.merger.disconnect();}catch(e){}
-  try{S.vGraph.revSend.disconnect();}catch(e){}
-  try{S.vGraph.conv.disconnect();}catch(e){}
-  try{S.vGraph.revReturn.disconnect();}catch(e){}
+  disc(g.modInput); disc(g.carrierGain); disc(g.wetMix);
+  disc(g.midG); disc(g.sideG); disc(g.merger); disc(g.master); disc(g.dry);
+  disc(g.revSend); disc(g.conv); disc(g.revReturn);
   S.vGraph=null;
 }
 
 // Called from XY pad — only sets AudioParam values, never creates nodes
 function applyXY(){
   if(!S.vGraph) return;
-  const x=S.xyX, y=S.xyY; // x=formant, y(top)=width/(bottom)=wet
-  const width=1-y;   // top of pad = max stereo width
-  const wet=0.3+y*0.5; // bottom = wetter
+  const x=S.xyX, y=S.xyY;
+  // X axis: formant shift (left=darker/lower, right=brighter/higher)
+  // Y axis: top=wide+dry, bottom=narrow+wet
+  const formantShift=Math.pow(2,(x-0.5)*0.8); // ±0.4 octave shift on band freqs
+  const width=1-y;
+  const wet=0.35+y*0.55;
+  const t=S.ctx.currentTime;
 
-  // Dry/wet
-  S.vGraph.dry.gain.setTargetAtTime(Math.max(0,1-wet),S.ctx.currentTime,0.05);
-
-  // Wet band gains
-  const wetPerBand=wet/S.vGraph.bands.length*1.8;
-  S.vGraph.bands.forEach(b=>b.bg.gain.setTargetAtTime(wetPerBand,S.ctx.currentTime,0.05));
-
-  // Formant shift — x shifts all band frequencies up or down by up to ±1 octave
-  const shift=Math.pow(2,(x-0.5)*1.2);
+  // Formant: shift all band frequencies together
   S.vGraph.bands.forEach(b=>{
-    b.bpf.frequency.setTargetAtTime(b.baseFreq*shift,S.ctx.currentTime,0.05);
+    b.modBPF.frequency.setTargetAtTime(b.baseFreq*formantShift,t,0.06);
+    b.carBPF.frequency.setTargetAtTime(b.baseFreq*formantShift,t,0.06);
   });
 
-  // Stereo width (side gain)
-  S.vGraph.sideG.gain.setTargetAtTime(width*0.9,S.ctx.currentTime,0.05);
+  // Wet/dry
+  S.vGraph.wetMix.gain.setTargetAtTime(wet*1.6,t,0.05);
+  S.vGraph.dry.gain.setTargetAtTime(Math.max(0,0.12-wet*0.1),t,0.05);
+
+  // Stereo width
+  S.vGraph.sideG.gain.setTargetAtTime(width*1.1,t,0.05);
+
+  // Reverb amount tracks width
+  S.vGraph.revReturn.gain.setTargetAtTime(0.15+width*0.35,t,0.05);
 
   // Reverb amount
   S.vGraph.revReturn.gain.setTargetAtTime(0.15+width*0.3,S.ctx.currentTime,0.05);
@@ -819,9 +919,14 @@ function scheduleSlice(idx, when){
   env.gain.setValueAtTime(1,endT-fade);
   env.gain.linearRampToValueAtTime(0,endT);
 
-  // Connect: src → env → vocoder input
+  // Connect: src → env → vocoder modulator input
   src.connect(env);
-  env.connect(S.vGraph.input);
+  env.connect(S.vGraph.modInput);
+
+  // Gate carrier on for this slice duration, off after
+  // Use setTargetAtTime for click-free on/off
+  S.vGraph.carrierGain.gain.setTargetAtTime(1.0, when, 0.005);
+  S.vGraph.carrierGain.gain.setTargetAtTime(0.0, endT-0.01, 0.02);
 
   src.start(when, sl.start, sl.duration);
   src.stop(endT+0.01);
