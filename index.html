@@ -191,6 +191,14 @@
     <div class="meta-chip"><div class="label">Level</div><div class="val" id="metaLevel">—</div></div>
   </div>
   <div class="duration-bar"><div class="duration-fill" id="durFill"></div></div>
+  <!-- Mic gain control -->
+  <div style="display:flex;align-items:center;gap:12px;">
+    <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:0.1em;white-space:nowrap;">Mic Gain</div>
+    <input type="range" id="micGainSlider" min="1" max="16" step="0.5" value="6"
+      style="-webkit-appearance:none;flex:1;height:6px;border-radius:3px;outline:none;background:linear-gradient(to right,var(--green) 33%,var(--slate2) 33%)"
+      oninput="onMicGain(this.value)">
+    <div style="font-size:12px;color:var(--green);font-weight:700;min-width:36px;text-align:right;" id="micGainVal">6×</div>
+  </div>
   <button class="proceed-btn" id="proceedBtn" onclick="goTo('config')">Configure Sample →</button>
 </div>
 
@@ -441,7 +449,11 @@ document.getElementById('startBtn').addEventListener('click', async()=>{
     S.analyser=S.ctx.createAnalyser();
     S.analyser.fftSize=1024;
     const mic=S.ctx.createMediaStreamSource(stream);
-    mic.connect(S.analyser);
+    // Boost mic level — mobile mics are often very quiet
+    S.micBoost=S.ctx.createGain();
+    S.micBoost.gain.value=6.0; // +6× (~16dB) — adjustable
+    mic.connect(S.micBoost);
+    S.micBoost.connect(S.analyser);
     document.getElementById('metaSR').textContent=(S.ctx.sampleRate/1000).toFixed(0)+'kHz';
     btn.textContent='Initialize Audio Engine'; btn.style.opacity='1';
     goTo('record');
@@ -495,6 +507,17 @@ function startWaveMonitor(){
     document.getElementById('metaLevel').textContent=lvl+'%';
   }
   frame();
+}
+
+// Mic gain — updates the pre-analyser boost node live
+function onMicGain(val){
+  const v=parseFloat(val);
+  document.getElementById('micGainVal').textContent=v.toFixed(1)+'×';
+  const pct=((v-1)/15)*100;
+  document.getElementById('micGainSlider').style.background=
+    `linear-gradient(to right,var(--green) ${pct}%,var(--slate2) ${pct}%)`;
+  if(S.micBoost) S.micBoost.gain.setTargetAtTime(v,S.ctx.currentTime,0.01);
+  S.micGainVal=v;
 }
 
 // ═══════════════════════════════════════════════════
@@ -749,7 +772,7 @@ function buildVocoderGraph(){
   ensembleOut.connect(preHP); preHP.connect(prePeak);
 
   // ── MODULATOR input ───────────────────────────────
-  const modInput=ctx.createGain(); modInput.gain.value=1.0;
+  const modInput=ctx.createGain(); modInput.gain.value=6.0; // boost quiet mic recordings
 
   // Rectifier curve |x|
   const rectCurve=(()=>{
