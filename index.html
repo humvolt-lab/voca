@@ -641,173 +641,200 @@ function renderBars(){
 // ═══════════════════════════════════════════════════
 //  REAL VOCODER GRAPH — built ONCE, lives forever
 //
-//  How it works:
-//    MODULATOR = vocal slice (the recorded voice)
-//    CARRIER   = thick synth (sawtooth stack + detuned voices)
-//
-//  For each of 16 frequency bands:
-//    1. BPF the modulator → measure its envelope (peak follower)
-//       via a rectifier (WaveShaper abs) + lowpass smoother
-//    2. BPF the carrier at the same frequency
-//    3. Multiply: carrier_band × modulator_envelope
-//       → the carrier "speaks" the vowel shape of the voice
-//
-//  Extra lushness:
-//    - 4 detuned sawtooth oscillators per voice (supersaw)
-//    - Chorus/ensemble on carrier before the bank
-//    - Plate reverb (convolver IR) for space
-//    - Mid/side stereo widener on output
-//    - Dry vocal blend for intelligibility
-//
-//  XY pad modulates AudioParams only — no new nodes during playback.
+//  CARRIER = 3-voice supersaw pad (each voice = 7 detuned saws)
+//            + square wave mid layer + sine sub
+//            + 4-tap ensemble chorus
+//  MODULATOR = vocal slice → 16-band envelope follower
+//  OUTPUT = mid/side widener → soft-clip drive → plate reverb
 // ═══════════════════════════════════════════════════
 function buildVocoderGraph(){
   if(S.vGraph) teardownVocoderGraph();
   const ctx=S.ctx;
   const SR=ctx.sampleRate;
 
-  // ── CARRIER: supersaw stack (4 detuned saws + sub) ──
-  // All oscillators run continuously; their output feeds the band filters.
-  const carrierGain=ctx.createGain(); carrierGain.gain.value=0.0; // silent until slice plays
-  const SAW_DETUNE=[-12,-4,0,4,12]; // cents detune for width
-  const saws=SAW_DETUNE.map(det=>{
-    const o=ctx.createOscillator();
-    o.type='sawtooth';
-    o.frequency.value=110; // base pitch A2 — warm, not high
-    o.detune.value=det;
-    const g=ctx.createGain(); g.gain.value=0.22;
-    o.connect(g); g.connect(carrierGain);
-    o.start(0);
-    return {osc:o,gain:g};
+  // ── CARRIER ──────────────────────────────────────
+  // 3 pitch layers (root, 5th above, octave above) each with 7 detuned saws
+  // = 21 saws total. Thick, lush, Juno/JP-8 style pad.
+  const carrierGain=ctx.createGain(); carrierGain.gain.value=0.0;
+
+  const VOICES=[
+    {freq:110, vol:0.38},   // A2 — root, warm and full
+    {freq:165, vol:0.22},   // E3 — perfect 5th, adds harmonic richness
+    {freq:220, vol:0.16},   // A3 — octave, presence without thinness
+  ];
+  // Detune spread across 7 saws per voice (cents)
+  const SAW_DETUNE=[-18,-10,-4,0,4,10,18];
+
+  const allSaws=[];
+  VOICES.forEach(({freq,vol})=>{
+    SAW_DETUNE.forEach(det=>{
+      const o=ctx.createOscillator(); o.type='sawtooth';
+      o.frequency.value=freq; o.detune.value=det;
+      const g=ctx.createGain(); g.gain.value=vol/SAW_DETUNE.length;
+      o.connect(g); g.connect(carrierGain);
+      o.start(0);
+      allSaws.push({osc:o,gain:g});
+    });
   });
-  // Sub oscillator — adds body
-  const sub=ctx.createOscillator();
-  sub.type='sine'; sub.frequency.value=55; // A1
-  const subG=ctx.createGain(); subG.gain.value=0.35;
-  sub.connect(subG); subG.connect(carrierGain);
-  sub.start(0);
 
-  // Carrier chorus — 2 slightly delayed+detuned copies for thickness
-  const chorusDelay1=ctx.createDelay(0.03); chorusDelay1.delayTime.value=0.011;
-  const chorusDelay2=ctx.createDelay(0.03); chorusDelay2.delayTime.value=0.017;
-  const chorusLFO1=ctx.createOscillator(); chorusLFO1.frequency.value=0.31; chorusLFO1.type='sine';
-  const chorusLFO2=ctx.createOscillator(); chorusLFO2.frequency.value=0.27; chorusLFO2.type='sine';
-  const clg1=ctx.createGain(); clg1.gain.value=0.003;
-  const clg2=ctx.createGain(); clg2.gain.value=0.003;
-  chorusLFO1.connect(clg1); clg1.connect(chorusDelay1.delayTime);
-  chorusLFO2.connect(clg2); clg2.connect(chorusDelay2.delayTime);
-  chorusLFO1.start(0); chorusLFO2.start(0);
-  const carrierChorus=ctx.createGain(); carrierChorus.gain.value=1.0;
-  carrierGain.connect(carrierChorus);
-  carrierGain.connect(chorusDelay1); chorusDelay1.connect(carrierChorus);
-  carrierGain.connect(chorusDelay2); chorusDelay2.connect(carrierChorus);
+  // Square wave layer — adds nasal/reed midrange body
+  const sqr=ctx.createOscillator(); sqr.type='square'; sqr.frequency.value=110;
+  const sqrG=ctx.createGain(); sqrG.gain.value=0.10;
+  sqr.connect(sqrG); sqrG.connect(carrierGain); sqr.start(0);
 
-  // ── MODULATOR input (vocal slices connect here) ──
+  // Octave-down sine sub — adds chest/weight
+  const sub=ctx.createOscillator(); sub.type='sine'; sub.frequency.value=55;
+  const subG=ctx.createGain(); subG.gain.value=0.40;
+  sub.connect(subG); subG.connect(carrierGain); sub.start(0);
+
+  // ── 4-TAP ENSEMBLE CHORUS ─────────────────────────
+  // Each tap has its own delay time slowly modulated by a unique LFO.
+  // Summed together before the vocoder bank = wide, lush, non-phasey spread.
+  const ensembleOut=ctx.createGain(); ensembleOut.gain.value=1.0;
+  carrierGain.connect(ensembleOut); // dry tap always present
+
+  const CHORUS_TAPS=[
+    {delay:0.009, lfoHz:0.23, lfoDepth:0.004},
+    {delay:0.014, lfoHz:0.17, lfoDepth:0.005},
+    {delay:0.021, lfoHz:0.31, lfoDepth:0.003},
+    {delay:0.031, lfoHz:0.13, lfoDepth:0.006},
+  ];
+  const chorusNodes=CHORUS_TAPS.map(({delay,lfoHz,lfoDepth})=>{
+    const dl=ctx.createDelay(0.06); dl.delayTime.value=delay;
+    const lfo=ctx.createOscillator(); lfo.type='sine'; lfo.frequency.value=lfoHz;
+    const lg=ctx.createGain(); lg.gain.value=lfoDepth;
+    const tapG=ctx.createGain(); tapG.gain.value=0.5;
+    lfo.connect(lg); lg.connect(dl.delayTime);
+    carrierGain.connect(dl); dl.connect(tapG); tapG.connect(ensembleOut);
+    lfo.start(0);
+    return {dl,lfo,lg,tapG};
+  });
+
+  // Gentle pre-filter on carrier: cut sub-60Hz rumble, shelf-boost 400-2kHz body
+  const preHP=ctx.createBiquadFilter(); preHP.type='highpass'; preHP.frequency.value=60;
+  const prePeak=ctx.createBiquadFilter(); prePeak.type='peaking';
+  prePeak.frequency.value=900; prePeak.Q.value=0.7; prePeak.gain.value=4;
+  ensembleOut.connect(preHP); preHP.connect(prePeak);
+
+  // ── MODULATOR input ───────────────────────────────
   const modInput=ctx.createGain(); modInput.gain.value=1.0;
 
-  // Absolute value shaper for envelope rectification
-  // Maps x → |x| so the lowpass sees only positive signal energy
+  // Rectifier curve |x|
   const rectCurve=(()=>{
-    const n=256, c=new Float32Array(n);
+    const n=512, c=new Float32Array(n);
     for(let i=0;i<n;i++) c[i]=Math.abs(i/(n/2)-1);
     return c;
   })();
 
-  // ── 16-BAND VOCODER BANK ──
+  // ── 16-BAND VOCODER BANK ─────────────────────────
   const BAND_FREQS=[
     80,160,280,430,600,800,1050,1350,
     1700,2150,2700,3400,4300,5400,6800,9000
   ];
-  const NUM_BANDS=BAND_FREQS.length;
 
   const bands=BAND_FREQS.map((freq,i)=>{
-    const Q=3.5; // narrow enough for formant resolution, wide enough for smooth sound
+    const Q=3.8;
 
-    // MODULATOR band: BPF vocal → rectify → smooth → controls VCA gain
+    // Modulator path
     const modBPF=ctx.createBiquadFilter();
     modBPF.type='bandpass'; modBPF.frequency.value=freq; modBPF.Q.value=Q;
     modInput.connect(modBPF);
-
     const rect=ctx.createWaveShaper(); rect.curve=rectCurve;
     modBPF.connect(rect);
-
-    // Envelope smoother: lowpass at ~30Hz tracks amplitude of band
+    // Two-stage smoother: faster attack (50Hz), slower release feel
     const envLP=ctx.createBiquadFilter();
-    envLP.type='lowpass'; envLP.frequency.value=30;
+    envLP.type='lowpass'; envLP.frequency.value=40;
     rect.connect(envLP);
 
-    // VCA: carrier band amplitude = modulator envelope
-    // envLP output drives the gain AudioParam of a GainNode
-    // We use a GainNode where .gain is modulated by the envelope signal
-    const vca=ctx.createGain(); vca.gain.value=0; // starts silent
-    // Connect envelope signal to the gain param (this is the key vocoder step)
+    // VCA
+    const vca=ctx.createGain(); vca.gain.value=0;
     envLP.connect(vca.gain);
 
-    // CARRIER band: BPF synth at same frequency
+    // Carrier path
     const carBPF=ctx.createBiquadFilter();
     carBPF.type='bandpass'; carBPF.frequency.value=freq; carBPF.Q.value=Q;
-    carrierChorus.connect(carBPF);
+    prePeak.connect(carBPF);
     carBPF.connect(vca);
 
-    // Per-band slow LFO on carrier BPF freq for subtle shimmer/chorus
-    const lfo=ctx.createOscillator();
-    lfo.type='sine'; lfo.frequency.value=0.06+i*0.018;
-    const lfog=ctx.createGain(); lfog.gain.value=freq*0.012;
+    // Per-band shimmer LFO
+    const lfo=ctx.createOscillator(); lfo.type='sine';
+    lfo.frequency.value=0.05+i*0.015+(i%3)*0.02;
+    const lfog=ctx.createGain(); lfog.gain.value=freq*0.010;
     lfo.connect(lfog); lfog.connect(carBPF.frequency);
     lfo.start(0);
 
     return {modBPF,rect,envLP,vca,carBPF,lfo,lfog,baseFreq:freq};
   });
 
-  // ── MIX + STEREO WIDTH ──
-  const wetMix=ctx.createGain(); wetMix.gain.value=1.4;
+  // ── WET MIX ──────────────────────────────────────
+  const wetMix=ctx.createGain(); wetMix.gain.value=1.6;
   bands.forEach(b=>b.vca.connect(wetMix));
 
   // Mid/side stereo widener
   const midG=ctx.createGain(); midG.gain.value=1.0;
-  const sideG=ctx.createGain(); sideG.gain.value=0.6;
+  const sideG=ctx.createGain(); sideG.gain.value=0.7;
   wetMix.connect(midG); wetMix.connect(sideG);
   const merger=ctx.createChannelMerger(2);
   midG.connect(merger,0,0);
   sideG.connect(merger,0,1);
 
-  // Master output
-  const master=ctx.createGain(); master.gain.value=0.8;
-  merger.connect(master);
+  // ── DRIVE / SOFT-CLIP ────────────────────────────
+  // Waveshaper with tanh-style soft saturation curve.
+  // Drive knob pre-gains into the shaper; output gain compensates.
+  const driveIn=ctx.createGain(); driveIn.gain.value=S.driveAmt||1.0;
+  merger.connect(driveIn);
+  const clipper=ctx.createWaveShaper();
+  clipper.oversample='4x';
+  function makeDriveCurve(amount){
+    const n=512, c=new Float32Array(n), k=amount;
+    for(let i=0;i<n;i++){
+      const x=i*2/n-1;
+      c[i]=k>1 ? (Math.PI+k)*x/(Math.PI+k*Math.abs(x)) : x;
+    }
+    return c;
+  }
+  clipper.curve=makeDriveCurve(S.driveAmt||1.0);
+  driveIn.connect(clipper);
 
-  // Dry vocal blend (keeps intelligibility)
-  const dry=ctx.createGain(); dry.gain.value=0.08;
+  // Post-drive gain (makeup)
+  const driveOut=ctx.createGain(); driveOut.gain.value=0.85;
+  clipper.connect(driveOut);
+
+  // Master output
+  const master=ctx.createGain(); master.gain.value=0.78;
+  driveOut.connect(master);
+
+  // Dry vocal blend
+  const dry=ctx.createGain(); dry.gain.value=0.07;
   modInput.connect(dry); dry.connect(master);
 
   master.connect(ctx.destination);
 
-  // ── PLATE REVERB ──
-  const revSend=ctx.createGain(); revSend.gain.value=0.25;
+  // ── PLATE REVERB ─────────────────────────────────
+  const revSend=ctx.createGain(); revSend.gain.value=0.3;
   const conv=ctx.createConvolver();
-  // Build a smooth plate-ish IR: exponential decay with early reflections
-  const irLen=Math.floor(SR*2.2);
+  const irLen=Math.floor(SR*2.4);
   const ir=ctx.createBuffer(2,irLen,SR);
   for(let ch=0;ch<2;ch++){
     const d=ir.getChannelData(ch);
     for(let i=0;i<irLen;i++){
-      // Early reflections cluster
-      const early=i<SR*0.02 ? Math.random()*0.6*(1-i/(SR*0.02)) : 0;
-      // Diffuse tail
-      const tail=(Math.random()*2-1)*Math.pow(1-i/irLen,1.8);
-      d[i]=early+tail*0.4;
+      const early=i<SR*0.025 ? (Math.random()*2-1)*0.5*(1-i/(SR*0.025)) : 0;
+      const tail=(Math.random()*2-1)*Math.pow(1-i/irLen,1.6);
+      d[i]=early+(tail*0.45)*(ch===1?-1:1); // flip phase L/R for stereo spread
     }
   }
   conv.buffer=ir;
-  const revReturn=ctx.createGain(); revReturn.gain.value=0.28;
+  const revReturn=ctx.createGain(); revReturn.gain.value=0.32;
   master.connect(revSend); revSend.connect(conv); conv.connect(revReturn);
   revReturn.connect(ctx.destination);
 
   S.vGraph={
-    modInput, carrierGain, master, dry, wetMix,
-    bands, midG, sideG, merger,
-    saws, sub, subG,
-    chorusDelay1, chorusDelay2, chorusLFO1, chorusLFO2, clg1, clg2,
-    carrierChorus, revSend, conv, revReturn
+    modInput,carrierGain,master,dry,wetMix,
+    bands,midG,sideG,merger,
+    allSaws,sqr,sqrG,sub,subG,
+    ensembleOut,chorusNodes,preHP,prePeak,
+    driveIn,clipper,driveOut,makeDriveCurve,
+    revSend,conv,revReturn
   };
   applyXY();
 }
@@ -815,20 +842,18 @@ function buildVocoderGraph(){
 function teardownVocoderGraph(){
   if(!S.vGraph) return;
   const g=S.vGraph;
-  const stopDisc=n=>{ try{n.stop();}catch(e){} try{n.disconnect();}catch(e){} };
-  const disc=n=>{ try{n.disconnect();}catch(e){} };
-  g.saws.forEach(s=>{ stopDisc(s.osc); disc(s.gain); });
-  stopDisc(g.sub); disc(g.subG);
-  stopDisc(g.chorusLFO1); stopDisc(g.chorusLFO2);
-  disc(g.clg1); disc(g.clg2);
-  disc(g.chorusDelay1); disc(g.chorusDelay2); disc(g.carrierChorus);
-  g.bands.forEach(b=>{
-    stopDisc(b.lfo); disc(b.lfog);
-    disc(b.modBPF); disc(b.rect); disc(b.envLP); disc(b.vca); disc(b.carBPF);
-  });
-  disc(g.modInput); disc(g.carrierGain); disc(g.wetMix);
-  disc(g.midG); disc(g.sideG); disc(g.merger); disc(g.master); disc(g.dry);
-  disc(g.revSend); disc(g.conv); disc(g.revReturn);
+  const sd=n=>{try{n.stop();}catch(e){}try{n.disconnect();}catch(e){}};
+  const d=n=>{try{n.disconnect();}catch(e){}};
+  g.allSaws.forEach(s=>{sd(s.osc);d(s.gain);});
+  sd(g.sqr);d(g.sqrG);sd(g.sub);d(g.subG);
+  g.chorusNodes.forEach(c=>{sd(c.lfo);d(c.lg);d(c.dl);d(c.tapG);});
+  d(g.ensembleOut);d(g.preHP);d(g.prePeak);
+  g.bands.forEach(b=>{sd(b.lfo);d(b.lfog);d(b.modBPF);d(b.rect);d(b.envLP);d(b.vca);d(b.carBPF);});
+  d(g.modInput);d(g.carrierGain);d(g.wetMix);
+  d(g.midG);d(g.sideG);d(g.merger);
+  d(g.driveIn);d(g.clipper);d(g.driveOut);
+  d(g.master);d(g.dry);
+  d(g.revSend);d(g.conv);d(g.revReturn);
   S.vGraph=null;
 }
 
@@ -1066,11 +1091,16 @@ function initXYPad(){
 
 function updateParamUI(){
   const x=S.xyX, y=S.xyY;
-  const width=1-y, wet=0.3+y*0.5;
-  document.getElementById('pFormant').textContent=x.toFixed(2);
+  const width=1-y, wet=0.35+y*0.55;
+  const formantShift=Math.pow(2,(x-0.5)*0.8);
+  // Show formant shift as semitones relative to center
+  const semis=((x-0.5)*0.8*12).toFixed(1);
+  const sign=semis>=0?'+':'';
+  document.getElementById('pFormant').textContent=sign+semis+'st';
   document.getElementById('pFormantBar').style.width=(x*100)+'%';
-  document.getElementById('pHarmonics').textContent=(x*1.2+0.4).toFixed(2);
-  document.getElementById('pHarmonicsBar').style.width=((x*0.6+0.4)*100)+'%';
+  // Carrier pitch is fixed A2 — show it
+  document.getElementById('pHarmonics').textContent='A2';
+  document.getElementById('pHarmonicsBar').style.width='50%';
   document.getElementById('pWidth').textContent=width.toFixed(2);
   document.getElementById('pWidthBar').style.width=(width*100)+'%';
   document.getElementById('pWet').textContent=wet.toFixed(2);
