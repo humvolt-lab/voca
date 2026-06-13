@@ -294,6 +294,14 @@
       </div>
       <button class="shuffle-btn" onclick="reshuffleNow()">⟳ Shuffle</button>
     </div>
+    <!-- Output level meter -->
+    <div style="display:flex;align-items:center;gap:10px;">
+      <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:0.1em;white-space:nowrap;">Out</div>
+      <div style="flex:1;height:6px;background:var(--slate2);border-radius:3px;overflow:hidden;">
+        <div id="outMeter" style="height:100%;width:0%;border-radius:3px;transition:width 0.04s;background:linear-gradient(to right,var(--green),var(--amber),var(--red));"></div>
+      </div>
+      <div style="font-size:10px;color:var(--dim);min-width:32px;text-align:right;" id="outMeterDb">—</div>
+    </div>
   </div>
   <div class="param-grid">
     <div class="param-card">
@@ -380,8 +388,8 @@ const S = {
 function goTo(id) {
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
   document.getElementById('screen-'+id).classList.add('active');
-  if (id==='play') initXYPad();
-  if (id==='record' && S.ctx && !S.waveMonitorRunning) startWaveMonitor();
+  if (id==='play') { initXYPad(); startOutMeter(); }
+  if (id==='record' && S.ctx) setTimeout(startWaveMonitor, 80);
 }
 
 // ═══════════════════════════════════════════════════
@@ -448,21 +456,30 @@ document.getElementById('startBtn').addEventListener('click', async()=>{
 //  WAVEFORM MONITOR (record screen)
 // ═══════════════════════════════════════════════════
 function startWaveMonitor(){
-  if(S.waveMonitorRunning) return;
-  S.waveMonitorRunning=true;
+  // Cancel any existing loop before starting a new one
+  if(S.waveAnimId) cancelAnimationFrame(S.waveAnimId);
+  S.waveMonitorRunning=false;
+
   const cv=document.getElementById('waveCanvas');
+  if(!cv.offsetWidth) return; // not visible yet, bail
+
   const c=cv.getContext('2d');
-  function resize(){
-    cv.width=cv.offsetWidth*devicePixelRatio;
-    cv.height=cv.offsetHeight*devicePixelRatio;
-    c.scale(devicePixelRatio,devicePixelRatio);
-  }
-  resize();
+  cv.width=cv.offsetWidth*devicePixelRatio;
+  cv.height=cv.offsetHeight*devicePixelRatio;
+  c.scale(devicePixelRatio,devicePixelRatio);
+
+  S.waveMonitorRunning=true;
   const buf=new Uint8Array(S.analyser.frequencyBinCount);
+
   function frame(){
     S.waveAnimId=requestAnimationFrame(frame);
+    // Stop drawing if we've left the record screen
+    if(!document.getElementById('screen-record').classList.contains('active')){
+      S.waveMonitorRunning=false;
+      return;
+    }
     S.analyser.getByteTimeDomainData(buf);
-    const W=cv.offsetWidth,H=cv.offsetHeight;
+    const W=cv.offsetWidth, H=cv.offsetHeight;
     c.fillStyle='#1A1D2E'; c.fillRect(0,0,W,H);
     c.beginPath();
     c.strokeStyle=S.isRecording?'#FF4466':'#9B4DFF'; c.lineWidth=2;
@@ -474,7 +491,8 @@ function startWaveMonitor(){
     c.stroke();
     let sum=0;
     for(let i=0;i<buf.length;i++) sum+=Math.abs(buf[i]-128);
-    document.getElementById('metaLevel').textContent=((sum/buf.length/128)*100).toFixed(0)+'%';
+    const lvl=((sum/buf.length/128)*100).toFixed(0);
+    document.getElementById('metaLevel').textContent=lvl+'%';
   }
   frame();
 }
@@ -824,6 +842,11 @@ function buildVocoderGraph(){
 
   master.connect(ctx.destination);
 
+  // Output analyser tap — for the play screen level meter
+  const outAnalyser=ctx.createAnalyser();
+  outAnalyser.fftSize=512;
+  master.connect(outAnalyser);
+
   // ── PLATE REVERB ─────────────────────────────────
   const revSend=ctx.createGain(); revSend.gain.value=0.3;
   const conv=ctx.createConvolver();
@@ -848,7 +871,7 @@ function buildVocoderGraph(){
     allSaws,sqr,sqrG,sub,subG,
     ensembleOut,chorusNodes,preHP,prePeak,
     driveIn,clipper,driveOut,makeDriveCurve,
-    revSend,conv,revReturn
+    revSend,conv,revReturn,outAnalyser
   };
   applyXY();
 }
@@ -867,7 +890,7 @@ function teardownVocoderGraph(){
   d(g.midG);d(g.sideG);d(g.merger);
   d(g.driveIn);d(g.clipper);d(g.driveOut);
   d(g.master);d(g.dry);
-  d(g.revSend);d(g.conv);d(g.revReturn);
+  d(g.revSend);d(g.conv);d(g.revReturn);d(g.outAnalyser);
   S.vGraph=null;
 }
 
@@ -1007,6 +1030,31 @@ function reshuffleNow(){
   const wasPlaying=S.playing;
   stopPlayback();
   if(wasPlaying) setTimeout(startPlayback,60);
+}
+
+// ═══════════════════════════════════════════════════
+//  OUTPUT LEVEL METER (play screen)
+// ═══════════════════════════════════════════════════
+let outMeterAnimId=null;
+function startOutMeter(){
+  if(outMeterAnimId) cancelAnimationFrame(outMeterAnimId);
+  const meterEl=document.getElementById('outMeter');
+  const dbEl=document.getElementById('outMeterDb');
+  const tmpBuf=new Float32Array(512);
+
+  function frame(){
+    outMeterAnimId=requestAnimationFrame(frame);
+    if(!document.getElementById('screen-play').classList.contains('active')) return;
+    if(!S.vGraph||!S.vGraph.outAnalyser){ meterEl.style.width='0%'; dbEl.textContent='—'; return; }
+    S.vGraph.outAnalyser.getFloatTimeDomainData(tmpBuf);
+    let peak=0;
+    for(let i=0;i<tmpBuf.length;i++) peak=Math.max(peak,Math.abs(tmpBuf[i]));
+    const pct=Math.min(100,peak*130); // scale 0–1 signal to 0–100%
+    const db=peak>0.0001 ? (20*Math.log10(peak)).toFixed(1) : '—';
+    meterEl.style.width=pct+'%';
+    dbEl.textContent=peak>0.0001 ? db+'dB' : '—';
+  }
+  frame();
 }
 
 // ═══════════════════════════════════════════════════
