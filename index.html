@@ -298,13 +298,8 @@
   <div class="param-grid">
     <div class="param-card">
       <div class="param-name">Formant Shift</div>
-      <div class="param-value" id="pFormant">0.50</div>
+      <div class="param-value" id="pFormant">0.00st</div>
       <div class="param-bar"><div class="param-bar-fill" id="pFormantBar" style="background:var(--violet);width:50%"></div></div>
-    </div>
-    <div class="param-card">
-      <div class="param-name">Carrier Pitch</div>
-      <div class="param-value" id="pHarmonics">A2</div>
-      <div class="param-bar"><div class="param-bar-fill" id="pHarmonicsBar" style="background:var(--green);width:50%"></div></div>
     </div>
     <div class="param-card">
       <div class="param-name">Stereo Width</div>
@@ -313,9 +308,27 @@
     </div>
     <div class="param-card">
       <div class="param-name">Dry / Wet</div>
-      <div class="param-value" id="pWet">0.50</div>
-      <div class="param-bar"><div class="param-bar-fill" id="pWetBar" style="background:var(--red);width:50%"></div></div>
+      <div class="param-value" id="pWet">0.63</div>
+      <div class="param-bar"><div class="param-bar-fill" id="pWetBar" style="background:var(--red);width:63%"></div></div>
     </div>
+    <div class="param-card">
+      <div class="param-name">Reverb</div>
+      <div class="param-value" id="pRev">0.32</div>
+      <div class="param-bar"><div class="param-bar-fill" id="pRevBar" style="background:var(--green);width:32%"></div></div>
+    </div>
+  </div>
+  <!-- DRIVE CONTROL -->
+  <div style="background:var(--slate);border-radius:14px;padding:14px 16px;display:flex;flex-direction:column;gap:10px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <div>
+        <div style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--dim);">Output Drive</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:2px;">Soft saturation — adds body &amp; heat</div>
+      </div>
+      <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:var(--amber);min-width:52px;text-align:right;" id="driveDisplay">1.0×</div>
+    </div>
+    <input type="range" id="driveSlider" min="1" max="20" step="0.5" value="1"
+      style="-webkit-appearance:none;width:100%;height:6px;border-radius:3px;outline:none;background:linear-gradient(to right,var(--amber) 0%,var(--slate2) 0%)" 
+      oninput="onDriveChange(this.value)">
   </div>
   <div style="height:calc(var(--safe-bottom) + 8px); flex-shrink:0"></div>
 </div>
@@ -340,6 +353,7 @@ const S = {
   // audio
   ctx: null, micStream: null, mediaRecorder: null,
   chunks: [], audioBuffer: null, analyser: null,
+  driveAmt: 1.0,
   // config
   bpm:120, key:'C', mode:'major', sliceDiv:'8',
   randomize:false, seed:null,
@@ -861,31 +875,35 @@ function teardownVocoderGraph(){
 function applyXY(){
   if(!S.vGraph) return;
   const x=S.xyX, y=S.xyY;
-  // X axis: formant shift (left=darker/lower, right=brighter/higher)
-  // Y axis: top=wide+dry, bottom=narrow+wet
-  const formantShift=Math.pow(2,(x-0.5)*0.8); // ±0.4 octave shift on band freqs
-  const width=1-y;
-  const wet=0.35+y*0.55;
+  const formantShift=Math.pow(2,(x-0.5)*0.8);
+  const width=1-y;          // top=wide, bottom=narrow
+  const wet=0.35+y*0.55;    // top=drier, bottom=wetter
+  const rev=0.12+width*0.38;
   const t=S.ctx.currentTime;
 
-  // Formant: shift all band frequencies together
   S.vGraph.bands.forEach(b=>{
     b.modBPF.frequency.setTargetAtTime(b.baseFreq*formantShift,t,0.06);
     b.carBPF.frequency.setTargetAtTime(b.baseFreq*formantShift,t,0.06);
   });
-
-  // Wet/dry
   S.vGraph.wetMix.gain.setTargetAtTime(wet*1.6,t,0.05);
-  S.vGraph.dry.gain.setTargetAtTime(Math.max(0,0.12-wet*0.1),t,0.05);
-
-  // Stereo width
+  S.vGraph.dry.gain.setTargetAtTime(Math.max(0,0.12-wet*0.08),t,0.05);
   S.vGraph.sideG.gain.setTargetAtTime(width*1.1,t,0.05);
+  S.vGraph.revReturn.gain.setTargetAtTime(rev,t,0.05);
+}
 
-  // Reverb amount tracks width
-  S.vGraph.revReturn.gain.setTargetAtTime(0.15+width*0.35,t,0.05);
-
-  // Reverb amount
-  S.vGraph.revReturn.gain.setTargetAtTime(0.15+width*0.3,S.ctx.currentTime,0.05);
+function onDriveChange(val){
+  S.driveAmt=parseFloat(val);
+  const pct=((S.driveAmt-1)/19)*100;
+  document.getElementById('driveSlider').style.background=
+    `linear-gradient(to right,var(--amber) ${pct}%,var(--slate2) ${pct}%)`;
+  document.getElementById('driveDisplay').textContent=S.driveAmt.toFixed(1)+'×';
+  if(!S.vGraph) return;
+  // Update drive gain and curve live — no new nodes
+  S.vGraph.driveIn.gain.setTargetAtTime(S.driveAmt,S.ctx.currentTime,0.02);
+  S.vGraph.clipper.curve=S.vGraph.makeDriveCurve(S.driveAmt);
+  // Makeup gain: louder drive = lower makeup to avoid clipping
+  const makeup=0.85/Math.max(1,Math.sqrt(S.driveAmt*0.5));
+  S.vGraph.driveOut.gain.setTargetAtTime(makeup,S.ctx.currentTime,0.02);
 }
 
 // ═══════════════════════════════════════════════════
@@ -1091,20 +1109,18 @@ function initXYPad(){
 
 function updateParamUI(){
   const x=S.xyX, y=S.xyY;
-  const width=1-y, wet=0.35+y*0.55;
-  const formantShift=Math.pow(2,(x-0.5)*0.8);
-  // Show formant shift as semitones relative to center
-  const semis=((x-0.5)*0.8*12).toFixed(1);
-  const sign=semis>=0?'+':'';
+  const width=1-y, wet=0.35+y*0.55, rev=0.12+width*0.38;
+  const semisNum=(x-0.5)*0.8*12;
+  const semis=semisNum.toFixed(1);
+  const sign=semisNum>=0?'+':'';
   document.getElementById('pFormant').textContent=sign+semis+'st';
   document.getElementById('pFormantBar').style.width=(x*100)+'%';
-  // Carrier pitch is fixed A2 — show it
-  document.getElementById('pHarmonics').textContent='A2';
-  document.getElementById('pHarmonicsBar').style.width='50%';
   document.getElementById('pWidth').textContent=width.toFixed(2);
   document.getElementById('pWidthBar').style.width=(width*100)+'%';
   document.getElementById('pWet').textContent=wet.toFixed(2);
   document.getElementById('pWetBar').style.width=(wet*100)+'%';
+  document.getElementById('pRev').textContent=rev.toFixed(2);
+  document.getElementById('pRevBar').style.width=(rev*100)+'%';
 }
 
 // Resume AudioContext on any user interaction (iOS requirement)
