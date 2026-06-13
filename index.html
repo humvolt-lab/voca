@@ -284,12 +284,12 @@
     <canvas id="xyCanvas"></canvas>
   </div>
   <div class="axis-row">
-    <span class="axis-lbl">← Formant</span>
-    <span class="axis-lbl">Harmonics →</span>
+    <span class="axis-lbl">← Dark / Bassy</span>
+    <span class="axis-lbl">Bright / Airy →</span>
   </div>
   <div class="axis-row" style="margin-top:-2px">
-    <span class="axis-lbl">↓ Wet</span>
-    <span class="axis-lbl">↑ Width</span>
+    <span class="axis-lbl">↑ Tight / Dry</span>
+    <span class="axis-lbl">↓ Wide / Drenched</span>
   </div>
   <div class="playback-section">
     <div class="playback-row">
@@ -340,10 +340,10 @@
         <div style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--dim);">Output Drive</div>
         <div style="font-size:11px;color:var(--dim);margin-top:2px;">Soft saturation — adds body &amp; heat</div>
       </div>
-      <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:var(--amber);min-width:52px;text-align:right;" id="driveDisplay">1.0×</div>
+      <div style="font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:var(--amber);min-width:52px;text-align:right;" id="driveDisplay">10.0×</div>
     </div>
-    <input type="range" id="driveSlider" min="1" max="20" step="0.5" value="1"
-      style="-webkit-appearance:none;width:100%;height:6px;border-radius:3px;outline:none;background:linear-gradient(to right,var(--amber) 0%,var(--slate2) 0%)" 
+    <input type="range" id="driveSlider" min="1" max="20" step="0.5" value="10"
+      style="-webkit-appearance:none;width:100%;height:6px;border-radius:3px;outline:none;background:linear-gradient(to right,var(--amber) 47.4%,var(--slate2) 47.4%)" 
       oninput="onDriveChange(this.value)">
   </div>
   <div style="height:calc(var(--safe-bottom) + 8px); flex-shrink:0"></div>
@@ -369,7 +369,7 @@ const S = {
   // audio
   ctx: null, micStream: null, mediaRecorder: null,
   chunks: [], audioBuffer: null, analyser: null,
-  driveAmt: 1.0,
+  driveAmt: 10.0,
   // config
   bpm:120, key:'C', mode:'major', sliceDiv:'8',
   randomize:false, seed:null,
@@ -920,21 +920,33 @@ function teardownVocoderGraph(){
 // Called from XY pad — only sets AudioParam values, never creates nodes
 function applyXY(){
   if(!S.vGraph) return;
-  const x=S.xyX, y=S.xyY;
-  const formantShift=Math.pow(2,(x-0.5)*0.8);
-  const width=1-y;          // top=wide, bottom=narrow
-  const wet=0.35+y*0.55;    // top=drier, bottom=wetter
-  const rev=0.12+width*0.38;
+  const x=S.xyX, y=S.xyY; // x=0(left)→1(right), y=0(top)→1(bottom)
   const t=S.ctx.currentTime;
 
+  // X AXIS: Formant / Vowel Colour
+  // Full ±1 octave sweep — left=dark bassy (oo), right=bright airy (ee)
+  const formantShift=Math.pow(2,(x-0.5)*2.0); // 0.5× to 2.0×
   S.vGraph.bands.forEach(b=>{
-    b.modBPF.frequency.setTargetAtTime(b.baseFreq*formantShift,t,0.06);
-    b.carBPF.frequency.setTargetAtTime(b.baseFreq*formantShift,t,0.06);
+    b.modBPF.frequency.setTargetAtTime(b.baseFreq*formantShift,t,0.04);
+    b.carBPF.frequency.setTargetAtTime(b.baseFreq*formantShift,t,0.04);
   });
-  S.vGraph.wetMix.gain.setTargetAtTime(wet*1.6,t,0.05);
-  S.vGraph.dry.gain.setTargetAtTime(Math.max(0,0.12-wet*0.08),t,0.05);
-  S.vGraph.sideG.gain.setTargetAtTime(width*1.1,t,0.05);
+  // Tilt carrier EQ along with formant for extra colour
+  const peakFreq=300+x*3000;
+  const peakGainDb=(x-0.5)*16;
+  S.vGraph.prePeak.frequency.setTargetAtTime(peakFreq,t,0.04);
+  S.vGraph.prePeak.gain.setTargetAtTime(peakGainDb,t,0.04);
+
+  // Y AXIS: Thickness / Space
+  // Top (y=0): dry, narrow, tight.  Bottom (y=1): wet, wide, drenched in reverb
+  const wet  =0.2+y*1.4;   // 0.2→1.6
+  const width=0.1+y*1.8;   // 0.1→1.9
+  const rev  =0.05+y*0.6;  // 0.05→0.65
+  S.vGraph.wetMix.gain.setTargetAtTime(wet,t,0.05);
+  S.vGraph.dry.gain.setTargetAtTime(Math.max(0,0.15-y*0.13),t,0.05);
+  S.vGraph.sideG.gain.setTargetAtTime(width,t,0.05);
+  S.vGraph.midG.gain.setTargetAtTime(Math.max(0.3,1.0-y*0.4),t,0.05);
   S.vGraph.revReturn.gain.setTargetAtTime(rev,t,0.05);
+  S.vGraph.revSend.gain.setTargetAtTime(0.15+y*0.4,t,0.05);
 }
 
 function onDriveChange(val){
@@ -1180,18 +1192,19 @@ function initXYPad(){
 
 function updateParamUI(){
   const x=S.xyX, y=S.xyY;
-  const width=1-y, wet=0.35+y*0.55, rev=0.12+width*0.38;
-  const semisNum=(x-0.5)*0.8*12;
-  const semis=semisNum.toFixed(1);
+  const semisNum=(x-0.5)*2.0*12;
   const sign=semisNum>=0?'+':'';
-  document.getElementById('pFormant').textContent=sign+semis+'st';
+  document.getElementById('pFormant').textContent=sign+semisNum.toFixed(1)+'st';
   document.getElementById('pFormantBar').style.width=(x*100)+'%';
+  const width=0.1+y*1.8;
   document.getElementById('pWidth').textContent=width.toFixed(2);
-  document.getElementById('pWidthBar').style.width=(width*100)+'%';
+  document.getElementById('pWidthBar').style.width=(Math.min(width/2,1)*100)+'%';
+  const wet=0.2+y*1.4;
   document.getElementById('pWet').textContent=wet.toFixed(2);
-  document.getElementById('pWetBar').style.width=(wet*100)+'%';
+  document.getElementById('pWetBar').style.width=(Math.min(wet/1.6,1)*100)+'%';
+  const rev=0.05+y*0.6;
   document.getElementById('pRev').textContent=rev.toFixed(2);
-  document.getElementById('pRevBar').style.width=(rev*100)+'%';
+  document.getElementById('pRevBar').style.width=(Math.min(rev/0.65,1)*100)+'%';
 }
 
 // Resume AudioContext on any user interaction (iOS requirement)
